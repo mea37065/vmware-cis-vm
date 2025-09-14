@@ -30,7 +30,19 @@ param(
     [string]$vCenter,
 
     [Parameter(Mandatory = $true)]
-    [string]$VMName
+    [string]$VMName,
+    
+    [Parameter(Mandatory = $false)]
+    [PSCredential]$Credential,
+    
+    [Parameter(Mandatory = $false)]
+    [switch]$WhatIf,
+    
+    [Parameter(Mandatory = $false)]
+    [switch]$Backup,
+    
+    [Parameter(Mandatory = $false)]
+    [string]$LogPath = "$env:TEMP\vmware-cis-hardening.log"
 )
 
 # ============================================
@@ -43,16 +55,45 @@ Write-Host "Configuring PowerCLI..." -ForegroundColor Cyan
 Set-PowerCLIConfiguration -Scope User -ParticipateInCEIP $false -Confirm:$false
 Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false
 
+# Setup logging
+Start-Transcript -Path $LogPath -Append
+
 # Connect to vCenter
 Write-Host "Connecting to vCenter: $vCenter ..." -ForegroundColor Cyan
-Connect-VIServer -Server $vCenter
+try {
+    if ($Credential) {
+        Connect-VIServer -Server $vCenter -Credential $Credential -ErrorAction Stop
+    } else {
+        Connect-VIServer -Server $vCenter -ErrorAction Stop
+    }
+    Write-Host "✅ Connected successfully" -ForegroundColor Green
+}
+catch {
+    Write-Error "Failed to connect to vCenter: $_"
+    Stop-Transcript
+    exit 1
+}
 
 # Load VM
 Write-Host "Loading VM: $VMName ..." -ForegroundColor Cyan
-$vm = Get-VM -Name $VMName
-if (-not $vm) {
-    Write-Error "VM '$VMName' not found."
+try {
+    $vm = Get-VM -Name $VMName -ErrorAction Stop
+    Write-Host "✅ VM found: $($vm.Name) (PowerState: $($vm.PowerState))" -ForegroundColor Green
+}
+catch {
+    Write-Error "VM '$VMName' not found: $_"
+    Disconnect-VIServer -Server $vCenter -Confirm:$false -ErrorAction SilentlyContinue
+    Stop-Transcript
     exit 1
+}
+
+# Backup current configuration if requested
+if ($Backup) {
+    Write-Host "Creating configuration backup..." -ForegroundColor Cyan
+    $backupPath = "$env:TEMP\$($vm.Name)_backup_$(Get-Date -Format 'yyyyMMdd_HHmmss').json"
+    $currentConfig = $vm.ExtensionData.Config.ExtraConfig | ConvertTo-Json
+    $currentConfig | Out-File -FilePath $backupPath
+    Write-Host "✅ Backup saved to: $backupPath" -ForegroundColor Green
 }
 
 # Hardening parameters
@@ -115,9 +156,40 @@ foreach ($line in $hardeningParams) {
 }
 
 # Apply configuration to VM
-$vm.ExtensionData.ReconfigVM($spec)
+if ($WhatIf) {
+    Write-Host "🔍 WHATIF: Would apply the following settings:" -ForegroundColor Yellow
+    foreach ($opt in $spec.ExtraConfig) {
+        Write-Host "  $($opt.Key) = $($opt.Value)" -ForegroundColor Yellow
+    }
+    Write-Host "🔍 WHATIF: No changes were made" -ForegroundColor Yellow
+} else {
+    try {
+        $vm.ExtensionData.ReconfigVM($spec)
+        Write-Host "✅ Hardening applied successfully to VM '$VMName'." -ForegroundColor Green
+        
+        # Verify some key settings
+        Write-Host "Verifying applied settings..." -ForegroundColor Cyan
+        $updatedVM = Get-VM -Name $VMName
+        $verifySettings = @("isolation.tools.copy.disable", "isolation.tools.paste.disable", "EnableUUID")
+        foreach ($setting in $verifySettings) {
+            $value = ($updatedVM.ExtensionData.Config.ExtraConfig | Where-Object {$_.Key -eq $setting}).Value
+            if ($value) {
+                Write-Host "✅ $setting = $value" -ForegroundColor Green
+            }
+        }
+    }
+    catch {
+        Write-Error "Failed to apply hardening: $_"
+        Disconnect-VIServer -Server $vCenter -Confirm:$false -ErrorAction SilentlyContinue
+        Stop-Transcript
+        exit 1
+    }
+}
 
-Write-Host "✅ Hardening applied successfully to VM '$VMName'." -ForegroundColor Green
+# Cleanup
+Disconnect-VIServer -Server $vCenter -Confirm:$false -ErrorAction SilentlyContinue
+Stop-Transcript
+Write-Host "📝 Log saved to: $LogPath" -ForegroundColor Cyan
 
 # Optional: Disconnect from vCenter
 #Disconnect-VIServer -Server $vCenter -Confirm:$false
